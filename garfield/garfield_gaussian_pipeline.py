@@ -9,8 +9,10 @@ import viser.transforms as vtf
 import open3d as o3d
 import cv2
 import time
-
+import numpy as np
+import os
 import torch
+import copy
 from nerfstudio.pipelines.base_pipeline import VanillaPipeline, VanillaPipelineConfig
 from torch.cuda.amp.grad_scaler import GradScaler
 from nerfstudio.viewer.viewer_elements import *
@@ -18,7 +20,7 @@ from nerfstudio.viewer.viewer import VISER_NERFSTUDIO_SCALE_RATIO
 from nerfstudio.models.splatfacto import SplatfactoModel
 
 from cuml.cluster.hdbscan import HDBSCAN
-from nerfstudio.models.splatfacto import RGB2SH
+from nerfstudio.models.splatfacto import RGB2SH,SH2RGB
 
 import tqdm
 
@@ -31,8 +33,15 @@ from garfield.garfield_datamanager import GarfieldDataManagerConfig, GarfieldDat
 from garfield.garfield_model import GarfieldModel, GarfieldModelConfig
 from garfield.garfield_pipeline import GarfieldPipelineConfig, GarfieldPipeline
 
+from collections import deque, defaultdict
+import torch.nn.functional as F
+
+import torch._dynamo
+torch._dynamo.config.suppress_errors = True
+
 def quat_to_rotmat(quat):
     assert quat.shape[-1] == 4, quat.shape
+    quat = F.normalize(quat, dim=-1)
     w, x, y, z = torch.unbind(quat, dim=-1)
     mat = torch.stack(
         [
@@ -48,6 +57,7 @@ def quat_to_rotmat(quat):
         ],
         dim=-1,
     )
+    
     return mat.reshape(quat.shape[:-1] + (3, 3))
 
 def generate_random_colors(N=5000) -> torch.Tensor:
@@ -77,6 +87,13 @@ class GarfieldGaussianPipeline(VanillaPipeline):
 
     Note that the pipeline training must be stopped before you can interact with the scene!!
     """
+    
+    """
+    WMX
+    Now add some new simple rotation controller for the scene.
+    """   
+    
+    
     model: SplatfactoModel
     garfield_pipeline: List[GarfieldPipeline]  # To avoid importing Viewer* from nerf pipeline
     state_stack: List[Dict[str, TensorType]]  # To revert to previous state
@@ -85,6 +102,9 @@ class GarfieldGaussianPipeline(VanillaPipeline):
     crop_group_list: List[TensorType]  # For storing gaussian crops (based on click point)
     crop_transform_handle: Optional[viser.TransformControlsHandle]  # For storing scene transform handle -- drag!
     cluster_labels: Optional[TensorType]  # For storing cluster labels
+
+    # new joint controller
+    conjunction_joint: Optional[viser.TransformControlsHandle]  # For storing joint controller
 
     def __init__(
         self,
@@ -127,12 +147,22 @@ class GarfieldGaussianPipeline(VanillaPipeline):
 
         self.move_current_crop = ViewerButton(name="Drag Current Crop", cb_hook=self._drag_current_crop, disabled=True)
         self.crop_transform_handle = None
-
+        
         self.cluster_scene = ViewerButton(name="Cluster Scene", cb_hook=self._cluster_scene, disabled=False, visible=False)
+        
+        # new joint controller 
+        self.add_joint_controller = ViewerButton(name="Add Joint Controller", cb_hook=self._add_joint_controller, disabled=True, visible=False)
+        self.conjunction_joint = None
+        self.currnet_selected_joint = None
+        self.skeleton = None    
+        #visualization of the conjunction area
+        self.visualize_conjunction_area = ViewerButton(name="Visualize Conjunction Area", cb_hook=self._visualize_conjunction_area, disabled=True, visible=False)
+
         self.cluster_scene_scale = ViewerSlider(name="Cluster Scale", min_value=0.0, max_value=2.0, step=0.01, default_value=0.0, disabled=False, visible=False)
         self.cluster_scene_shuffle_colors = ViewerButton(name="Reshuffle Cluster Colors", cb_hook=self._reshuffle_cluster_colors, disabled=False, visible=False)
         self.cluster_labels = None
 
+       
         self.reset_state = ViewerButton(name="Reset State", cb_hook=self._reset_state, disabled=True)
 
         self.z_export_options = ViewerCheckbox(name="Export Options", default_value=False, cb_hook=self._update_export_options)
@@ -143,6 +173,13 @@ class GarfieldGaussianPipeline(VanillaPipeline):
             )
         self.z_export_options_camera_path_filename = ViewerText("Camera Path Filename", "", visible=False)
         self.z_export_options_camera_path_render = ViewerButton("Render Current Pipeline", cb_hook=self.render_from_path, visible=False)
+        
+        
+        #save/load groupings state
+        self.z_a = ViewerCheckbox(name="Grouping State", default_value=False, cb_hook=self._update_save_state_options)
+        self.z_b = ViewerButton(name="Save State",visible=False,cb_hook=self._save_state)
+        self.z_c = ViewerButton("Load State", cb_hook=self._load_state, visible=False)
+        self.z_d = ViewerText("State Path Filename", "", visible=False)
 
     def _update_interaction_method(self, dropdown: ViewerDropdown):
         """Update the UI based on the interaction method"""
@@ -151,7 +188,7 @@ class GarfieldGaussianPipeline(VanillaPipeline):
         self.cluster_scene.set_hidden((not hide_in_interactive))
         self.cluster_scene_scale.set_hidden((not hide_in_interactive))
         self.cluster_scene_shuffle_colors.set_hidden((not hide_in_interactive))
-
+        
         self.click_gaussian.set_hidden(hide_in_interactive)
         self.crop_to_click.set_hidden(hide_in_interactive)
         self.crop_to_group_level.set_hidden(hide_in_interactive)
@@ -163,6 +200,16 @@ class GarfieldGaussianPipeline(VanillaPipeline):
         self.z_export_options_camera_path_render.set_hidden(not checkbox.value)
         self.z_export_options_visible_gaussians.set_hidden(not checkbox.value)
 
+    def _update_save_state_options(self, checkbox: ViewerCheckbox):
+        """Update the UI based on the export options"""
+        # self.z_state_path_filename.set_hidden(not checkbox.value)
+        # self.z_save_state_options_visible_gaussians.set_hidden(not checkbox.value)
+        # self.z_save_load_state.set_hidden(not checkbox.value)
+        self.z_b.set_hidden(not checkbox.value)
+        self.z_c.set_hidden(not checkbox.value)
+        self.z_d.set_hidden(not checkbox.value)
+    
+    
     def _reset_state(self, button: ViewerButton):
         """Revert to previous saved state"""
         assert len(self.state_stack) > 0, "No previous state to revert to"
@@ -190,7 +237,30 @@ class GarfieldGaussianPipeline(VanillaPipeline):
 
         self.cluster_labels = None
         self.cluster_scene.set_disabled(False)
+        
+        #reset controller
+        # if self.conjunction_joint is not None:
+        #     self.conjunction_joint.remove()
+        if self.conjunction_joint is not None:
+            for i in range(len(self.conjunction_joint)):
+                self.conjunction_joint[i].remove()
 
+        if self.skeleton is not None:
+            for i in range(len(self.skeleton)):
+                self.skeleton[i].remove()
+        
+        if self.currnet_selected_joint is not None:
+            self.currnet_selected_joint.remove()
+        
+        self.add_joint_controller.set_disabled(True)
+        self.add_joint_controller.set_hidden(True)
+        
+        
+        
+        #reset visualization of the conjunction area
+        self.visualize_conjunction_area.set_disabled(True)
+        self.visualize_conjunction_area.set_hidden(True)
+        
     def _queue_state(self):
         """Save current state to stack"""
         import copy
@@ -254,7 +324,6 @@ class GarfieldGaussianPipeline(VanillaPipeline):
         # The only way to reset is to reset the state using the reset button.
         self.click_gaussian.set_disabled(True)  # Disable user from changing click
         self.crop_to_click.set_disabled(True)  # Disable user from changing click
-
         # Get the 3D location of the click
         location = self.click_location
         location = torch.tensor(location).view(1, 3).to(self.device)
@@ -359,8 +428,9 @@ class GarfieldGaussianPipeline(VanillaPipeline):
         
         self.crop_group_list = keep_list
         self.crop_to_group_level.set_disabled(False)
-        self.crop_to_group_level.value = 29
+        # self.crop_to_group_level.value = 29   # MX : There uis something wrong with this line!!!!!!!!!!!!!!!
         self.move_current_crop.set_disabled(False)
+
 
     def _update_crop_vis(self, number: ViewerSlider):
         """Update which click-based crop to visualize -- this requires that _crop_to_click has been called."""
@@ -424,7 +494,406 @@ class GarfieldGaussianPipeline(VanillaPipeline):
             self.model.gauss_params['quats'] = torch.nn.Parameter(quats.float())
 
             self.viewer_control.viewer._trigger_rerender()  # trigger viewer rerender
+    
+    def joint_controller(self):
+        
+        """Add a joint controller to the scene, and update the model accordingly."""
+        self.crop_to_group_level.set_disabled(True)  # Disable user from changing crop
+        self.move_current_crop.set_disabled(True)  # Disable user from creating another drag handle
+        
+      
+        #rgb_visualization
+        prev_state = self.state_stack[-1]
+        for name in self.model.gauss_params.keys():
+            self.model.gauss_params[name] = prev_state[name].clone()
 
+        curr_means = self.model.gauss_params['means'].clone().detach()
+        curr_labels = self.cluster_labels.clone().detach()
+        print("get initial means and rotmats")
+
+        #find joint for each groupings
+        #1.for each groupings, find the the connection groupings and build the graph(how to define connection?)
+        #2.set the root node as the groupings connected to the most groupings
+        #3.build the hierarchy tree (how to define the node structure?) 
+        
+        #find the connection groupings
+        def find_connections(means, labels, n, threshold=0.02):
+            """
+            find the connection between groupings
+            """
+            unique_labels = labels.unique()
+            connections = []
+            connected_graph = torch.eye(len(unique_labels))
+            connected_points = torch.zeros(len(unique_labels), len(unique_labels),3)
+            for i in range(len(unique_labels)):
+                for j in range(i + 1, len(unique_labels)):
+                    group_i_points = means[labels == unique_labels[i]]
+                    group_j_points = means[labels == unique_labels[j]]
+                    # Compute pairwise distances between points in the two groups
+                    dists = torch.cdist(group_i_points, group_j_points).detach().cpu()
+                    # Identify points within the threshold distance
+                    close_pairs = dists < threshold
+                    if close_pairs.sum() >= n:
+                        # Extract the indices of points that are close
+                        close_i_indices, close_j_indices = torch.where(close_pairs)
+                        # Calculate the mean position of these points
+                        close_points = torch.cat((group_i_points[close_i_indices], group_j_points[close_j_indices]), dim=0)
+                        mean_pos = close_points.mean(dim=0)
+                        connections.append((int(unique_labels[i].item()), int(unique_labels[j].item()), mean_pos.tolist()))
+                        # else:print(f"Group {unique_labels[i]} and {unique_labels[j]} are not connected. Found {close_pairs.sum()} close points out of required {n}.")
+                        connected_graph[i, j] = 1
+                        connected_graph[j, i] = 1
+                        connected_points[i, j] = mean_pos
+                        connected_points[j, i] = mean_pos
+            return connections,connected_graph,connected_points
+                        
+        #set the root node as the groupings connected to the most groupings
+        def find_root_node(connections):
+            """
+            Finds the root node based on the number of connections.
+            """
+            connection_counts = {}
+            for c in connections:
+                connection_counts[c[0]] = connection_counts.get(c[0], 0) + 1
+                connection_counts[c[1]] = connection_counts.get(c[1], 0) + 1
+            root_node = max(connection_counts, key=connection_counts.get)
+            return root_node
+        
+        def build_tree_with_hierarchy(connections, root_label):
+            bidirectional_map = defaultdict(list)
+            for parent, child, _ in connections:
+                bidirectional_map[parent].append(child)
+                bidirectional_map[child].append(parent)
+
+            unidirectional_map = {}
+            level = {root_label: 0}  # Initialize root level here
+            queue = deque([root_label])
+            joint_position = {root_label: curr_means[curr_labels == root_label].mean(dim=0).tolist()}
+            
+            while queue:
+                node = queue.popleft()
+                
+                for neighbor in bidirectional_map[node]:
+                    if neighbor not in level:  # Ensure neighbor hasn't been visited
+                        # Establish parent-child relationship
+                        if node not in unidirectional_map:
+                            unidirectional_map[node] = []
+                        unidirectional_map[node].append(neighbor)
+                        for c in connections:
+                            if (c[0], c[1]) == (neighbor, node) or (c[0], c[1]) == (node, neighbor):
+                                joint_position[neighbor] = c[2]  # x[2] is the mean position
+                                break  # Exit the loop after finding the first match
+                        queue.append(neighbor)
+                        level[neighbor] = level[node] + 1  # Assign level safely
+
+            return unidirectional_map, joint_position
+        
+        def find_all_descendants(tree, node_i):
+            """
+            Find all descendants of node_i in the tree, including children, grandchildren, etc.
+            """
+            descendants = []
+            # Direct children of node_i
+            children = tree.get(node_i, [])
+            
+            for child in children:
+                # Add the child
+                descendants.append(child)
+                # Recursively find and add the child's descendants
+                descendants.extend(find_all_descendants(tree, child))
+                
+            return descendants
+        
+        def find_children(tree, node_i):
+            """
+            Find all of node_i's children in the tree.
+            """
+            return tree.get(node_i, [])
+        
+        def build_conjunction_joint(tree, joint_position):
+            conjunction_joint= {}
+            def traverse_and_add_controls(parent , node , path_name):
+                # Update the path name to include the current node
+                current_path_name = f"{path_name}/group_{node}" if path_name else f"group_{node}"  
+                # Calculate group centroid for the current node, if applicable
+                if parent != node:
+                    relative_joint_position = np.array(joint_position[node]) - np.array(joint_position[parent])
+                else:
+                    relative_joint_position = np.array(joint_position[node])
+                    
+                group_transform_handle = self.viewer_control.viser_server.add_transform_controls(
+                    name = current_path_name,
+                    position = (VISER_NERFSTUDIO_SCALE_RATIO * relative_joint_position),
+                    scale=0.6*(0.75 ** current_path_name.count("/")),
+                    # disable_axes = True,
+                    disable_sliders = True,
+                )
+                
+                conjunction_joint[node] = group_transform_handle
+                
+                # Recursively add controls for the children, updating the path name
+                for child in find_children(tree, node):
+                    traverse_and_add_controls(node , child, current_path_name)
+
+            traverse_and_add_controls(root_label, root_label, "")
+            return conjunction_joint    
+  
+        def build_skeleton(tree, joint_position):
+            if self.skeleton is not None:
+                for i in range(len(self.skeleton)):
+                    self.skeleton[i].remove()
+                    
+            skeleton= {}
+            def traverse_and_add_line(parent , node , path_name):
+                # Update the path name to include the current node
+                current_path_name = f"{path_name}/{node}" if path_name else f"{node}"   
+                 
+                line =  self.viewer_control.viser_server.add_spline_catmull_rom(
+                    name = current_path_name,
+                    positions =np.array([joint_position[parent], joint_position[node]]) * VISER_NERFSTUDIO_SCALE_RATIO,
+                    tension = 0.5,
+                    line_width = 3.0,
+                    color=np.array([1.0, 0.0, 1.0]),
+                    segments = 100 )
+                
+                skeleton[node] = line
+                
+                # Recursively add controls for the children, updating the path name
+                for child in find_children(tree, node):
+                    traverse_and_add_line(node , child, current_path_name)
+
+            traverse_and_add_line(root_label, root_label, "")
+            return skeleton   
+        
+        def build_parent_mapping(tree_structure):
+            parent_map = {}
+            for parent, children in tree_structure.items():
+                for child in children:
+                    parent_map[child] = parent
+            return parent_map
+
+        def pose2mat(pose:torch.Tensor):
+            """
+            Converts a 7-vector pose to a 4x4 transformation matrix
+            """
+            t = pose[:,:3]
+            q = pose[:,3:]
+            rot = quat_to_rotmat(q)
+            mat = torch.eye(4)[None].repeat(pose.size(0),1,1)
+            mat[:,:3,:3] = rot
+            mat[:,:3,3] = t
+            return mat
+                
+         
+        connections,self.connected_graph ,self.connected_points = find_connections(curr_means, curr_labels, n = 2)
+        root_label = find_root_node(connections)
+        tree, joint_position = build_tree_with_hierarchy(connections, root_label) 
+        
+        self.curr_joints =  torch.tensor([joint_position[i] for i in sorted(joint_position.keys())]).to(self.device)   # world space joint positions
+        self.tree = tree
+        self.root_label = root_label
+        self.parent_map = build_parent_mapping(tree)
+         
+        #visualization (controller + skeleton)
+        self.conjunction_joint = build_conjunction_joint(tree, joint_position)
+        self.skeleton = build_skeleton(tree, self.curr_joints.detach().cpu().numpy())
+        self.relative_joint_position = []
+        for i in range(len(self.curr_joints)):
+            if i == root_label:
+                self.relative_joint_position.append(self.curr_joints[i])
+            else:
+                self.relative_joint_position.append(self.curr_joints[i]-self.curr_joints[self.parent_map[i]])
+        self.relative_joint_position = torch.stack(self.relative_joint_position).to(self.device)                   
+        #To update the joint position
+        print(tree)
+        self.tree_list = [root_label] + find_all_descendants(tree, root_label)
+        
+        ###########################################################################################################################
+        #set up for the transformation
+        self.init_means = self.model.gauss_params['means'].detach().clone()
+        self.init_quats = self.model.gauss_params['quats'].detach().clone()
+        self.group_masks = self.cluster_labels
+        self.joint_position = self.curr_joints
+        self.num_joints = len(self.joint_position)
+        self.updated_joint_position = self.joint_position.detach().clone()
+        
+        def relative_joint_positions(joints):
+            """
+            input: world position of the joints 
+            Returns the relative joint positions given the joint positions 4*4
+            """
+            root_transformation = torch.eye(4,device=self.device)
+            root_transformation[:3,3] = joints[self.root_label]
+            
+            relative_joints = {self.root_label: root_transformation}
+            for p_node,c_node in self.tree.items():
+                for node in c_node:
+                    relative_joints[node] = torch.eye(4,device=self.device)
+                    relative_joints[node][:3,3] = joints[node] - joints[p_node]
+                
+            return relative_joints
+        ###########################################################################################################################
+        #set up for the transformation
+        self.relative_joint_poses = relative_joint_positions(self.joint_position)
+        
+        def gaussian_local_pose():
+            """
+            Returns the local pose of each gaussian in the camera coordinate system
+            """
+            # V_wg = T_wc V_cg -> V_cg = T_wc^-1 V_wg : gaussian pose in child frame
+            updated_curr_means = self.init_means.clone()
+            updated_curr_rotmats = quat_to_rotmat(self.init_quats.clone())
+            
+            local_transoform = torch.tile(torch.eye(4),(len(self.group_masks),1,1)).to(self.device)
+            for node in self.relative_joint_poses.keys():
+                group_inds = np.isin(self.group_masks,[node])
+                group_inds = torch.tensor(group_inds).to(self.device)
+                curr_means = updated_curr_means[group_inds]
+                curr_rotates = updated_curr_rotmats[group_inds]
+                
+                w_vector = torch.tile(torch.eye(4),(len(curr_means),1,1)).to(self.device)
+                w_vector[:,:3,:3] = curr_rotates
+                w_vector[:,:3,3] = curr_means
+                
+                w_frame = torch.eye(4).to(self.device)
+                w_frame[:3,3] = self.joint_position[node]
+                
+                local_transoform[group_inds] = torch.matmul(torch.inverse(w_frame)[None].repeat(w_vector.shape[0],1,1),w_vector)
+            
+            return local_transoform
+        ###########################################################################################################################
+        #set up for the transformation
+        self.local_gaussian_pose = gaussian_local_pose()  
+        def apply_to_model(pose_deltas):
+            with torch.no_grad():
+                self.model.gauss_params['means'] = self.init_means.clone()
+                self.model.gauss_params['quats'] = self.init_quats.clone()
+            updated_joint_poses = {}
+            delta_mat = pose2mat(pose_deltas).to(self.device)
+            for node,j_pose in self.relative_joint_poses.items():
+                updated_joint_poses[node] = j_pose @ delta_mat[node] 
+            
+            #run forward kinematics to update the joint positions
+            world_poses = {}
+            queue = deque([self.root_label])
+            #make sure the root is updated first, update parent first then children
+            while queue:
+                current_node = queue.popleft()
+                if current_node in self.tree:
+                    for child in self.tree[current_node]:
+                        queue.append(child) 
+                
+                if current_node == self.root_label:
+                    world_poses[current_node] = updated_joint_poses[current_node]
+                else:
+                    #T_wc = T_wp @ T_pc
+                    world_poses[current_node] = world_poses[self.parent_map[current_node]] @ updated_joint_poses[current_node]
+
+            #apply transformation at one time
+            means = self.model.gauss_params['means'].detach()
+            rotmats = self.model.gauss_params['quats'].detach()
+            
+            updated_curr_means = self.init_means.clone()
+            updated_curr_rotmats = quat_to_rotmat(self.init_quats.clone())
+            w_poses = torch.tile(torch.eye(4),(self.model.num_points,1,1)).to(self.device)
+            for node,w_pose in world_poses.items():
+                group_inds = np.isin(self.group_masks,[node])
+                group_inds = torch.tensor(group_inds).to(self.device)
+                w_poses[group_inds] = w_pose
+        
+            local_transoform = self.local_gaussian_pose
+            updated_transform = torch.matmul(w_poses,local_transoform)
+            
+            updated_curr_means = updated_transform[:,:3, 3]
+            updated_curr_rotmats = updated_transform[:,:3,:3]
+
+            means = updated_curr_means
+            rotmats = torch.Tensor(Rot.from_matrix(updated_curr_rotmats.detach().cpu().numpy()).as_quat()).to(self.device)
+            rotmats = rotmats[:, [3, 0, 1, 2]]
+            
+            self.model.gauss_params['means'] = means.float()
+            self.model.gauss_params['quats'] = rotmats.float()
+
+            #update joint_position
+            self.updated_joint_position = torch.stack([world_poses[i][:3,3] for i in sorted(world_poses.keys())]).to(self.device)
+
+        for i in self.tree_list:
+            def set_callback_in_closure(i: int) -> None:
+                @self.conjunction_joint[i].on_update
+                def _(_) -> None: 
+                    pose_deltas = torch.zeros(int(self.group_masks.unique().max()+1),7,dtype=torch.float32,device='cuda')
+                    pose_deltas[:,3:] = torch.tensor([1,0,0,0],dtype=torch.float32,device='cuda')
+                    for j in range(len(self.tree_list)):
+                        pose_deltas[j,:3] = torch.tensor(self.conjunction_joint[j].position).to(self.device)/VISER_NERFSTUDIO_SCALE_RATIO  -  self.relative_joint_position[j].clone()
+                        pose_deltas[j,3:] = torch.tensor(self.conjunction_joint[j].wxyz).to(self.device).float()
+                        
+                    apply_to_model(pose_deltas)
+                    self.skeleton = build_skeleton(self.tree, self.updated_joint_position.clone().detach().cpu().numpy())
+                    self.viewer_control.viewer._trigger_rerender()  
+                    
+                    
+            set_callback_in_closure(i)
+            
+    def _add_joint_controller (self, button: ViewerButton):
+        self.joint_controller()
+    
+    def _visualize_conjunction_area(self, button: ViewerButton):
+        
+        """find all the conjunciton area"""
+        def find_conjunction_points(points, groupings, threshold):
+            # Ensure groupings is on the same device as points
+            groupings = groupings.detach().cpu()
+            points = points.detach().cpu()
+            # Calculate pairwise distances between points
+            dist_matrix = torch.cdist(points, points, p=2)
+
+            # Initialize a tensor of False, indicating non-conjunction points
+            conjunction_mask = torch.zeros(points.size(0), dtype=torch.bool, device=points.device)
+
+            # Iterate over each point
+            for i in range(points.size(0)):
+                # Get distances to all other points and check if they are in a different grouping
+                distances = dist_matrix[i]
+                other_groupings = groupings != groupings[i]
+
+                # Find if there's any point within the threshold distance belonging to a different group
+                is_conjunction = (distances <= threshold) & other_groupings
+
+                # If any such point exists, mark the current point as a conjunction point
+                if is_conjunction.any():
+                    conjunction_mask[i] = True
+            
+            return conjunction_mask
+        
+        """Add controllers to all the groupings."""
+        self.crop_to_group_level.set_disabled(True)  # Disable user from changing crop
+        self.move_current_crop.set_disabled(True)  # Disable user from creating another drag handle
+            
+        #rgb_visualization
+        prev_state = self.state_stack[-1]
+        for name in self.model.gauss_params.keys():
+            self.model.gauss_params[name] = prev_state[name].clone()
+        
+        
+        curr_means = self.model.gauss_params['means'].clone().detach()
+        curr_labels = self.cluster_labels.clone().detach()
+        
+        conjunction_mask = find_conjunction_points(curr_means, curr_labels, 0.01).to(self.device)
+        
+        #visualize the conjunction area-show them in red
+        features_dc = self.model.gauss_params['features_dc'].detach()
+        features_rest = self.model.gauss_params['features_rest'].detach()
+        red_color = torch.tensor([1.0, 0.0, 0.0])
+        features_dc[conjunction_mask] = RGB2SH(red_color.to(self.model.gauss_params['features_dc']))
+        features_rest[conjunction_mask] = 0
+        self.model.gauss_params['features_dc'] = torch.nn.Parameter(self.model.gauss_params['features_dc'])
+        self.model.gauss_params['features_rest'] = torch.nn.Parameter(self.model.gauss_params['features_rest'])
+        
+        opacities = self.model.gauss_params['opacities'].detach()
+        opacities = torch.logit(torch.ones_like(opacities)* 0.1)
+        opacities[conjunction_mask] = torch.logit(torch.ones_like(opacities)* 0.5)[conjunction_mask]
+        self.model.gauss_params['opacities'] = torch.nn.Parameter(opacities)
+    
     def _reshuffle_cluster_colors(self, button: ViewerButton):
         """Reshuffle the cluster colors, if clusters defined using `_cluster_scene`."""
         if self.cluster_labels is None:
@@ -518,6 +987,7 @@ class GarfieldGaussianPipeline(VanillaPipeline):
         labels = clusterer.labels_
         print(f"done. Took {time.time()-start} seconds. Found {labels.max() + 1} clusters.")
 
+        # Relabel the noise points to the nearest cluster
         noise_mask = labels == -1
         if noise_mask.sum() != 0 and (labels>=0).sum() > 0:
             # if there is noise, but not all of it is noise, relabel the noise
@@ -533,9 +1003,10 @@ class GarfieldGaussianPipeline(VanillaPipeline):
             noise_relabels = labels[valid_mask][indices[:, 0]]
             labels[noise_mask] = noise_relabels
             clusterer.labels_ = labels
-
+        
+        #color the groupings
         labels = clusterer.labels_
-
+        
         colormap = self.colormap
 
         opacities = self.model.gauss_params['opacities'].detach()
@@ -556,6 +1027,14 @@ class GarfieldGaussianPipeline(VanillaPipeline):
 
         self.cluster_scene.set_disabled(False)
         self.viewer_control.viewer._trigger_rerender()  # trigger viewer rerender
+        
+        #now add the joint controller based on the clustering results
+        #in cluster mode, we can add joint controller
+        self.add_joint_controller.set_disabled(False)
+        self.add_joint_controller.set_visible(True)
+        
+        self.visualize_conjunction_area.set_disabled(False)
+        self.visualize_conjunction_area.set_visible(True)
 
     def _export_visible_gaussians(self, button: ViewerButton):
         """Export the visible gaussians to a .ply file"""
@@ -564,63 +1043,38 @@ class GarfieldGaussianPipeline(VanillaPipeline):
         filename = Path(output_dir) / f"gaussians.ply"
 
         # Copied from exporter.py
-        from collections import OrderedDict
-        map_to_tensors = OrderedDict()
-        model=self.model
+        map_to_tensors = {}
 
         with torch.no_grad():
-            positions = model.means.cpu().numpy()
-            count = positions.shape[0]
-            n = count
-            map_to_tensors["x"] = positions[:, 0]
-            map_to_tensors["y"] = positions[:, 1]
-            map_to_tensors["z"] = positions[:, 2]
-            map_to_tensors["nx"] = np.zeros(n, dtype=np.float32)
-            map_to_tensors["ny"] = np.zeros(n, dtype=np.float32)
-            map_to_tensors["nz"] = np.zeros(n, dtype=np.float32)
+            positions = self.model.gauss_params['means'].cpu().numpy()
+            map_to_tensors["positions"] = o3d.core.Tensor(positions, o3d.core.float32)
+            map_to_tensors["normals"] = o3d.core.Tensor(np.zeros_like(positions), o3d.core.float32)
 
-            if model.config.sh_degree > 0:
-                shs_0 = model.shs_0.contiguous().cpu().numpy()
-                for i in range(shs_0.shape[1]):
-                    map_to_tensors[f"f_dc_{i}"] = shs_0[:, i, None]
+            colors = self.model.colors.data.cpu().numpy()
+            map_to_tensors["colors"] = (colors * 255).astype(np.uint8)
+            for i in range(colors.shape[1]):
+                map_to_tensors[f"f_dc_{i}"] = colors[:, i : i + 1]
 
-                # transpose(1, 2) was needed to match the sh order in Inria version
-                shs_rest = model.shs_rest.transpose(1, 2).contiguous().cpu().numpy()
-                shs_rest = shs_rest.reshape((n, -1))
-                for i in range(shs_rest.shape[-1]):
-                    map_to_tensors[f"f_rest_{i}"] = shs_rest[:, i, None]
-            else:
-                colors = torch.clamp(model.colors.clone(), 0.0, 1.0).data.cpu().numpy()
-                map_to_tensors["colors"] = (colors * 255).astype(np.uint8)
+            shs = self.model.shs_rest.data.cpu().numpy()
+            if self.model.config.sh_degree > 0:
+                shs = shs.reshape((colors.shape[0], -1, 1))
+                for i in range(shs.shape[-1]):
+                    map_to_tensors[f"f_rest_{i}"] = shs[:, i]
 
-            map_to_tensors["opacity"] = model.opacities.data.cpu().numpy()
+            map_to_tensors["opacity"] = self.model.gauss_params['opacities'].data.cpu().numpy()
 
-            scales = model.scales.data.cpu().numpy()
+            scales = self.model.gauss_params['scales'].data.cpu().unsqueeze(-1).numpy()
             for i in range(3):
-                map_to_tensors[f"scale_{i}"] = scales[:, i, None]
+                map_to_tensors[f"scale_{i}"] = scales[:, i]
 
-            quats = model.quats.data.cpu().numpy()
+            quats = self.model.gauss_params['quats'].data.cpu().unsqueeze(-1).numpy()
+
             for i in range(4):
-                map_to_tensors[f"rot_{i}"] = quats[:, i, None]
+                map_to_tensors[f"rot_{i}"] = quats[:, i]
 
-        # post optimization, it is possible have NaN/Inf values in some attributes
-        # to ensure the exported ply file has finite values, we enforce finite filters.
-        select = np.ones(n, dtype=bool)
-        for k, t in map_to_tensors.items():
-            n_before = np.sum(select)
-            select = np.logical_and(select, np.isfinite(t).all(axis=-1))
-            n_after = np.sum(select)
-            if n_after < n_before:
-                CONSOLE.print(f"{n_before - n_after} NaN/Inf elements in {k}")
+        pcd = o3d.t.geometry.PointCloud(map_to_tensors)
 
-        if np.sum(select) < n:
-            CONSOLE.print(f"values have NaN/Inf in map_to_tensors, only export {np.sum(select)}/{n}")
-            for k, t in map_to_tensors.items():
-                map_to_tensors[k] = map_to_tensors[k][select]
-            count = np.sum(select)
-        from nerfstudio.scripts.exporter import ExportGaussianSplat
-        ExportGaussianSplat.write_ply(str(filename), count, map_to_tensors)
-
+        o3d.t.io.write_point_cloud(str(filename), pcd)
 
     def render_from_path(self, button: ViewerButton):
         from nerfstudio.cameras.camera_paths import get_path_from_json
@@ -646,3 +1100,44 @@ class GarfieldGaussianPipeline(VanillaPipeline):
                 output_format="video",
             )
         self.model.train()
+    
+    def _save_state(self, button: ViewerButton):
+        """Save the current state of the model."""
+        """the only thing I need to save is the mask?"""
+        #save the current state
+        params_to_save = {}
+        for k, v in self.model.gauss_params.items():
+            params_to_save[k] = v  # assuming v is already a torch.Tensor
+
+        #save label
+        params_to_save["cluster_labels"] = self.cluster_labels
+
+        # Save to file
+        state_path_filename = Path ("state/" + self.z_d.value+ ".pt")    
+        state_path_filename = state_path_filename 
+        
+        torch.save(params_to_save, state_path_filename)
+
+    def load_state_from_path(self,state_path_filename,blend_color=False):
+        self._queue_state()
+        loaded_state = torch.load(state_path_filename)
+        for name in self.model.gauss_params.keys():
+            if blend_color and name == "features_dc":
+                # self.model.gauss_params[name] =  self.model.gauss_params[name]
+                # self.model.gauss_params[name] = (self.model.gauss_params[name] + loaded_state[name].clone().to(self.device)) / 2
+                self.model.gauss_params[name] = loaded_state[name].clone().to(self.device) *0.5+ self.model.gauss_params[name] *0.5
+            else: 
+                self.model.gauss_params[name] = loaded_state[name].clone().to(self.device)
+
+        
+        #not good to load the cluster labels
+        if  loaded_state["cluster_labels"] is not None:
+            self.cluster_labels = loaded_state["cluster_labels"].clone()
+            self._queue_state()
+            self.joint_controller()
+        
+        
+    def _load_state(self, button: ViewerButton):
+        """Load the previous state of the model."""
+        state_path_filename = Path ("state/" + self.z_d.value+ ".pt")
+        self.load_state_from_path(state_path_filename)
